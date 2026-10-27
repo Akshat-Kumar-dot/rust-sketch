@@ -1,0 +1,39 @@
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Rust Ink</title>
+</head>
+<body>
+    <header class="toolbar">
+        <h1>Rust Ink</h1>
+
+        <div class="tools">
+            <button id="penBtn" class="active">Pen</button>
+            <button id="eraserBtn">Eraser</button>
+
+            <label>
+                Color
+                <input type="color" id="colorPicker" value="#202020" />
+            </label>
+
+            <label>
+                Size
+                <input type="range" id="sizePicker" min="1" max="20" value="4" />
+            </label>
+
+            <button id="clearBtn">Clear</button>
+            <span id="zoomLabel">100%</span>
+        </div>
+    </header>
+
+    <main id="workspace">
+        <canvas id="canvas"></canvas>
+        <div class="hint">Draw · Space + drag to pan · Scroll to zoom</div>
+    </main>
+
+    <script type="module" src="/src/main.ts"></script>
+</body>
+</html>
