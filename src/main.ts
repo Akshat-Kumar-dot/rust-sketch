@@ -1,231 +1,183 @@
+import { InkCanvas, type DrawableStroke } from './canvas';
+import { loadEngine, type Engine } from './engine';
+import { loadOptions, loadStrokes, saveOptions, saveStrokes, type Stroke } from './store';
 
-import "./style.css";
+const $ = <T extends HTMLElement>(id: string) => document.getElementById(id) as T;
 
-const canvas = document.querySelector<HTMLCanvasElement>("#canvas")!;
-const ctx = canvas.getContext("2d")!;
-const workspace = document.querySelector<HTMLElement>("#workspace")!;
+const statusEl = $('status');
+const colorEl = $<HTMLInputElement>('color');
+const sizeEl = $<HTMLInputElement>('size');
+const smoothLiveEl = $<HTMLInputElement>('smoothLive');
+const showRawEl = $<HTMLInputElement>('showRaw');
+const undoBtn = $<HTMLButtonElement>('undo');
+const redoBtn = $<HTMLButtonElement>('redo');
+const clearBtn = $<HTMLButtonElement>('clear');
 
-const penBtn = document.querySelector<HTMLButtonElement>("#penBtn")!;
-const eraserBtn = document.querySelector<HTMLButtonElement>("#eraserBtn")!;
-const colorPicker = document.querySelector<HTMLInputElement>("#colorPicker")!;
-const sizePicker = document.querySelector<HTMLInputElement>("#sizePicker")!;
-const clearBtn = document.querySelector<HTMLButtonElement>("#clearBtn")!;
-const zoomLabel = document.querySelector<HTMLElement>("#zoomLabel")!;
-
-type Point = { x: number; y: number };
-
-type Stroke = {
-    color: string;
-    size: number;
-    points: Point[];
-};
-
-let strokes: Stroke[] = [];
-let currentStroke: Stroke | null = null;
-
-let drawing = false;
-let panning = false;
-let spacePressed = false;
-let tool: "pen" | "eraser" = "pen";
-
-let color = colorPicker.value;
-let size = Number(sizePicker.value);
-
-let zoom = 1;
-let offsetX = 0;
-let offsetY = 0;
-
-let panStartX = 0;
-let panStartY = 0;
-
-function resizeCanvas(): void {
-    const rect = workspace.getBoundingClientRect();
-    const dpr = window.devicePixelRatio || 1;
-
-    canvas.width = Math.round(rect.width * dpr);
-    canvas.height = Math.round(rect.height * dpr);
-
-    render();
+function setStatus(text: string, bad = false): void {
+  statusEl.textContent = text;
+  statusEl.classList.toggle('bad', bad);
+  statusEl.title = text;
 }
 
-function screenToWorld(x: number, y: number): Point {
-    return {
-        x: (x - offsetX) / zoom,
-        y: (y - offsetY) / zoom
-    };
-}
+async function main(): Promise<void> {
+  const options = loadOptions();
+  colorEl.value = options.color;
+  sizeEl.value = String(options.size);
+  smoothLiveEl.checked = options.smoothLive;
+  showRawEl.checked = options.showRaw;
 
-function getPointerPosition(
-    event: Pick<PointerEvent, "clientX" | "clientY">
-): Point {
-    const rect = canvas.getBoundingClientRect();
+  const canvas = new InkCanvas($('stage'));
 
-    return {
-        x: event.clientX - rect.left,
-        y: event.clientY - rect.top
-    };
-}
+  let engine: Engine;
+  try {
+    engine = await loadEngine();
+  } catch (err) {
+    setStatus('engine failed to load: run `npm run dev` (it builds the Rust first)', true);
+    console.error(err);
+    return;
+  }
+  setStatus(`${engine.info} · loaded ${new Date().toLocaleTimeString()}`);
 
-function drawStroke(stroke: Stroke): void {
-    if (stroke.points.length === 0) return;
-
-    ctx.beginPath();
-    ctx.strokeStyle = stroke.color;
-    ctx.lineWidth = stroke.size;
-    ctx.lineCap = "round";
-    ctx.lineJoin = "round";
-
-    ctx.moveTo(stroke.points[0].x, stroke.points[0].y);
-
-    for (let i = 1; i < stroke.points.length; i++) {
-        ctx.lineTo(stroke.points[i].x, stroke.points[i].y);
+  let engineError = false;
+  const smooth = (raw: ArrayLike<number>): Float32Array => {
+    const input = Float32Array.from(raw);
+    try {
+      const out = engine.smoothStroke(input);
+      if (engineError) {
+        engineError = false;
+        setStatus(`${engine.info} · loaded ${new Date().toLocaleTimeString()}`);
+      }
+      return out;
+    } catch (err) {
+      // a Rust panic lands here; draw the raw stroke instead so the app keeps working
+      engineError = true;
+      setStatus(`Rust error (see console): ${String(err)}`, true);
+      console.error('smooth_stroke failed', err);
+      return input;
     }
+  };
 
-    if (stroke.points.length === 1) {
-        ctx.lineTo(stroke.points[0].x + 0.01, stroke.points[0].y);
+  let strokes: Stroke[] = loadStrokes();
+  let redo: Stroke[] = [];
+  const smoothed = new Map<number, Float32Array>();
+
+  const drawable = (s: Stroke): DrawableStroke => {
+    let pts = smoothed.get(s.id);
+    if (!pts) {
+      pts = smooth(s.raw);
+      smoothed.set(s.id, pts);
     }
+    return { color: s.color, width: s.width, pts };
+  };
 
-    ctx.stroke();
-}
+  const redrawAll = () => canvas.renderStatic(strokes.map(drawable));
+  const syncButtons = () => {
+    undoBtn.disabled = strokes.length === 0;
+    redoBtn.disabled = redo.length === 0;
+  };
 
-function render(): void {
-    const dpr = window.devicePixelRatio || 1;
+  canvas.setResizeHandler(redrawAll);
+  redrawAll();
+  syncButtons();
 
-    ctx.setTransform(1, 0, 0, 1, 0, 0);
-    ctx.clearRect(0, 0, canvas.width, canvas.height);
+  // ---- drawing ----
+  let current: Stroke | null = null;
+  let rafPending = false;
+  let nextId = strokes.reduce((m, s) => Math.max(m, s.id), 0) + 1;
 
-    ctx.setTransform(
-        dpr * zoom, 0,
-        0, dpr * zoom,
-        dpr * offsetX, dpr * offsetY
-    );
-
-    for (const stroke of strokes) {
-        drawStroke(stroke);
+  const pushSamples = (e: PointerEvent) => {
+    if (!current) return;
+    const events = e.getCoalescedEvents?.() ?? [];
+    for (const ev of events.length ? events : [e]) {
+      const { x, y } = canvas.pointFromEvent(ev);
+      current.raw.push(x, y, ev.pressure || 0.5, ev.timeStamp);
     }
+  };
 
-    if (currentStroke) {
-        drawStroke(currentStroke);
+  const drawCurrent = () => {
+    rafPending = false;
+    if (!current) return;
+    const rawPts = Float32Array.from(current.raw);
+    const pts = options.smoothLive ? smooth(rawPts) : rawPts;
+    canvas.drawLive({ color: current.color, width: current.width, pts }, options.showRaw ? rawPts : undefined);
+  };
+
+  canvas.live.addEventListener('pointerdown', (e) => {
+    if (e.button !== 0 && e.pointerType === 'mouse') return;
+    canvas.live.setPointerCapture(e.pointerId);
+    current = { id: nextId++, color: options.color, width: options.size, raw: [] };
+    pushSamples(e);
+    if (!rafPending) {
+      rafPending = true;
+      requestAnimationFrame(drawCurrent);
     }
-}
+  });
 
-canvas.addEventListener("pointerdown", (event: PointerEvent) => {
-    canvas.setPointerCapture(event.pointerId);
-
-    const pos = getPointerPosition(event);
-
-    if (spacePressed || event.button === 1) {
-        panning = true;
-        panStartX = pos.x - offsetX;
-        panStartY = pos.y - offsetY;
-        canvas.style.cursor = "grabbing";
-        return;
+  canvas.live.addEventListener('pointermove', (e) => {
+    if (!current) return;
+    pushSamples(e);
+    if (!rafPending) {
+      rafPending = true;
+      requestAnimationFrame(drawCurrent);
     }
+  });
 
-    if (event.button !== 0) return;
+  const finish = (e: PointerEvent) => {
+    if (!current) return;
+    pushSamples(e);
+    const done = current;
+    current = null;
+    canvas.clearLive();
+    if (done.raw.length === 0) return;
+    strokes.push(done);
+    redo = [];
+    canvas.appendStatic(drawable(done));
+    saveStrokes(strokes);
+    syncButtons();
+  };
+  canvas.live.addEventListener('pointerup', finish);
+  canvas.live.addEventListener('pointercancel', finish);
 
-    drawing = true;
+  // ---- toolbar ----
+  const undo = () => {
+    const s = strokes.pop();
+    if (!s) return;
+    redo.push(s);
+    redrawAll();
+    saveStrokes(strokes);
+    syncButtons();
+  };
+  const redoAction = () => {
+    const s = redo.pop();
+    if (!s) return;
+    strokes.push(s);
+    redrawAll();
+    saveStrokes(strokes);
+    syncButtons();
+  };
 
-    const point = screenToWorld(pos.x, pos.y);
-
-    currentStroke = {
-        color: tool === "eraser" ? "#fafaf8" : color,
-        size: tool === "eraser" ? size * 4 : size,
-        points: [point]
-    };
-
-    render();
-});
-
-canvas.addEventListener("pointermove", (event: PointerEvent) => {
-    const pos = getPointerPosition(event);
-
-    if (panning) {
-        offsetX = pos.x - panStartX;
-        offsetY = pos.y - panStartY;
-        render();
-        return;
-    }
-
-    if (!drawing || !currentStroke) return;
-
-    currentStroke.points.push(screenToWorld(pos.x, pos.y));
-    render();
-});
-
-function stopInteraction(): void {
-    if (drawing && currentStroke) {
-        strokes.push(currentStroke);
-    }
-
-    drawing = false;
-    panning = false;
-    currentStroke = null;
-
-    canvas.style.cursor = spacePressed ? "grab" : "crosshair";
-    render();
-}
-
-canvas.addEventListener("pointerup", stopInteraction);
-canvas.addEventListener("pointercancel", stopInteraction);
-
-canvas.addEventListener("wheel", (event: WheelEvent) => {
-    event.preventDefault();
-
-    const pos = getPointerPosition(event);
-    const worldBeforeZoom = screenToWorld(pos.x, pos.y);
-
-    const factor = event.deltaY < 0 ? 1.1 : 1 / 1.1;
-    zoom = Math.min(5, Math.max(0.2, zoom * factor));
-
-    offsetX = pos.x - worldBeforeZoom.x * zoom;
-    offsetY = pos.y - worldBeforeZoom.y * zoom;
-
-    zoomLabel.textContent = `${Math.round(zoom * 100)}%`;
-    render();
-}, { passive: false });
-
-window.addEventListener("keydown", (event: KeyboardEvent) => {
-    if (event.code === "Space" && !event.repeat) {
-        spacePressed = true;
-        canvas.style.cursor = "grab";
-        event.preventDefault();
-    }
-});
-
-window.addEventListener("keyup", (event: KeyboardEvent) => {
-    if (event.code === "Space") {
-        spacePressed = false;
-        canvas.style.cursor = "crosshair";
-    }
-});
-
-penBtn.addEventListener("click", () => {
-    tool = "pen";
-    penBtn.classList.add("active");
-    eraserBtn.classList.remove("active");
-});
-
-eraserBtn.addEventListener("click", () => {
-    tool = "eraser";
-    eraserBtn.classList.add("active");
-    penBtn.classList.remove("active");
-});
-
-colorPicker.addEventListener("input", () => {
-    color = colorPicker.value;
-});
-
-sizePicker.addEventListener("input", () => {
-    size = Number(sizePicker.value);
-});
-
-clearBtn.addEventListener("click", () => {
+  undoBtn.onclick = undo;
+  redoBtn.onclick = redoAction;
+  clearBtn.onclick = () => {
     strokes = [];
-    currentStroke = null;
-    render();
-});
+    redo = [];
+    smoothed.clear();
+    redrawAll();
+    saveStrokes(strokes);
+    syncButtons();
+  };
 
-window.addEventListener("resize", resizeCanvas);
+  colorEl.oninput = () => { options.color = colorEl.value; saveOptions(options); };
+  sizeEl.oninput = () => { options.size = Number(sizeEl.value); saveOptions(options); };
+  smoothLiveEl.onchange = () => { options.smoothLive = smoothLiveEl.checked; saveOptions(options); };
+  showRawEl.onchange = () => { options.showRaw = showRawEl.checked; saveOptions(options); };
 
-resizeCanvas();
+  window.addEventListener('keydown', (e) => {
+    if (!(e.ctrlKey || e.metaKey)) return;
+    const k = e.key.toLowerCase();
+    if (k === 'z' && !e.shiftKey) { e.preventDefault(); undo(); }
+    else if ((k === 'z' && e.shiftKey) || k === 'y') { e.preventDefault(); redoAction(); }
+  });
+}
+
+void main();
